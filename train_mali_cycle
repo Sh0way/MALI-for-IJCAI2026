@@ -1,0 +1,340 @@
+import argparse
+import os
+import pandas as pd
+import torch
+import torch.optim as optim
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+from torch import nn
+from torchvision import datasets
+from torchvision.utils import save_image
+import time
+import math
+
+from utils import set_requires_grad, calculate_fid, save_reconstruction_grid
+
+
+def main():
+    # --- Arguments ---
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', type=str, default='celebA', help='cifar10 | celebA | ffhq')
+    # parser.add_argument('--dataroot', type=str, default=r'H:\数据集\archive', help='path to dataset')
+    parser.add_argument('--dataroot', type=str, default='data/celeba', help='path to dataset')
+    parser.add_argument('--batchSize', type=int, default=64)
+    parser.add_argument('--imageSize', type=int, default=256, help='32, 64, 128, 256')
+    parser.add_argument('--z_dim', type=int, default=512)
+    parser.add_argument('--niter', type=int, default=500)
+    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--outf', default='output/dcgan_celeba_cycle_tixing', help='output folder')
+    parser.add_argument('--fid_interval', type=int, default=5, help='calc FID every N epochs')
+    parser.add_argument('--save_real_ref', action='store_true', help='save real images for FID calc')
+
+    parser.add_argument('--model', type=str, default='dcgan', choices=['dcgan', 'fastgan', 'r3gan', 'resnet'],
+                        help='backbone architecture')
+
+    opt = parser.parse_args()
+    print(opt)
+
+    save_img_path = opt.outf + '/img_log'
+    save_model_path = opt.outf + '/check_point'
+    os.makedirs(save_img_path, exist_ok=True)
+    os.makedirs(save_model_path, exist_ok=True)
+
+    if opt.model == 'r3gan':
+        from models.models_r3gan_v1 import Generator, SharedEncoder
+    elif opt.model =='fastgan':
+        from models.models_fastgan import Generator, SharedEncoder
+    elif opt.model == 'resnet':
+        from models.models_resnet import Generator, SharedEncoder
+    else:
+        from models.models_dcgan import Generator, SharedEncoder
+
+    os.makedirs(opt.outf, exist_ok=True)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def weights_init(m):
+        classname = m.__class__.__name__
+        if classname.find('Conv') != -1:
+            nn.init.normal_(m.weight.data, 0.0, 0.02)
+        elif classname.find('BatchNorm') != -1:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+            nn.init.constant_(m.bias.data, 0)
+
+    # 定义一个更科学的初始化函数，专门配合 GLU 和 SN
+    def weights_init_advanced(m):
+        classname = m.__class__.__name__
+        if classname.find('Conv') != -1 or classname.find('Linear') != -1:
+            if hasattr(m, 'weight') and m.weight is not None:
+                # 使用正交初始化，这对 GAN 尤其是带 SN 的 GAN 至关重要
+                nn.init.orthogonal_(m.weight, gain=0.02)
+            if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif classname.find('BatchNorm') != -1:
+            nn.init.normal_(m.weight.data, 1.0, 0.02)
+            nn.init.constant_(m.bias.data, 0)
+
+    # --- Data Loading (Dynamic) ---
+    transform = transforms.Compose([
+        # transforms.Resize(opt.imageSize),
+        transforms.CenterCrop(opt.imageSize),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
+    dataset = datasets.ImageFolder(root=opt.dataroot, transform=transform)
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=opt.batchSize, shuffle=True, drop_last=True,
+                                             num_workers=4)
+
+    # Save some real images for FID calculation (Reference)
+    real_ref_path = os.path.join(opt.outf, 'real_images_fid')
+    if not os.path.exists(real_ref_path):
+        os.makedirs(real_ref_path)
+        print("Saving real images for FID reference...")
+        try:
+            iterator = iter(dataloader)
+            for i in range(1000 // opt.batchSize + 1):
+                real_batch, _ = next(iterator)
+                for j in range(real_batch.size(0)):
+                    save_image(real_batch[j] * 0.5 + 0.5, os.path.join(real_ref_path, f'{i * opt.batchSize + j}.jpg'))
+        except StopIteration:
+            pass
+
+    # --- Model Init ---
+    netA = Generator(z_dim=opt.z_dim, img_size=opt.imageSize).to(device)
+    netB = Generator(z_dim=opt.z_dim, img_size=opt.imageSize).to(device)
+    netE = SharedEncoder(z_dim=opt.z_dim, img_size=opt.imageSize).to(device)
+
+    # 应用初始化
+    if opt.model == 'fastgan':
+        netA.apply(weights_init_advanced)
+        netB.apply(weights_init_advanced)
+        netE.apply(weights_init_advanced)
+    elif opt.model == 'r3gan':
+        pass
+    else:
+        netA.apply(weights_init)
+        netB.apply(weights_init)
+        netE.apply(weights_init)
+
+    # --- Optimizers ---
+    if opt.model == 'r3gan':
+        optimizerA = optim.AdamW(netA.parameters(), lr=opt.lr, betas=(0.5, 0.999), weight_decay=1e-4)
+        optimizerB = optim.AdamW(netB.parameters(), lr=opt.lr, betas=(0.5, 0.999), weight_decay=1e-4)
+        optimizerE = optim.AdamW(netE.parameters(), lr=opt.lr, betas=(0.5, 0.999), weight_decay=1e-4)
+    else:
+        optimizerA = optim.Adam(netA.parameters(), lr=opt.lr, betas=(0.5, 0.999))
+        optimizerB = optim.Adam(netB.parameters(), lr=opt.lr, betas=(0.5, 0.999))
+        optimizerE = optim.Adam(netE.parameters(), lr=opt.lr, betas=(0.5, 0.999))
+
+    # Fixed noise for visualization
+    fixed_noise = torch.randn(opt.batchSize, opt.z_dim, 1, 1).to(device)
+    # Fixed real batch for reconstruction visualization
+    try:
+        fixed_real, _ = next(iter(dataloader))
+        fixed_real = fixed_real[:8].to(device)
+    except:
+        fixed_real = torch.randn(8, 3, opt.imageSize, opt.imageSize).to(device)
+
+    # def get_swap_threshold(global_step):
+    #     if global_step < 10000:
+    #         return 20
+    #
+    #     elif global_step < 60000:
+    #         # 计算当前进度 (0.0 -> 1.0)
+    #         progress = (global_step - 10000) / 50000.0
+    #         # 线性插值: 从 20 增长到 800
+    #         return int(20 + progress * (800 - 20))
+    #
+    #     elif global_step < 100000:
+    #         return 1500
+    #
+    #     else:
+    #         return 3000
+
+    def get_trapezoidal_threshold(global_step, total_step):
+        """
+        梯形周期调度函数 (Trapezoidal Schedule)
+        1. Upswing (0% - 20%): 线性增长 (Start -> Max)
+        2. Plateau (20% - 70%): 维持最大值 (Max)
+        3. Downswing (70% - 100%): 指数衰减 (Max -> Min) - 实现流形融合
+        """
+
+        # 参数配置
+        MIN_PERIOD = 20
+        MAX_PERIOD = 500
+
+        # 阶段划分点
+        phase1_end = total_step * 0.2
+        phase2_end = total_step * 0.7
+
+        if global_step < phase1_end:
+            progress = global_step / phase1_end
+            current_period = MIN_PERIOD + progress * (MAX_PERIOD - MIN_PERIOD)
+
+        elif global_step < phase2_end:
+            current_period = MAX_PERIOD
+
+        else:
+            progress = (global_step - phase2_end) / (total_steps - phase2_end)
+            log_max = math.log(MAX_PERIOD)
+            log_min = math.log(MIN_PERIOD)
+            log_curr = log_max - progress * (log_max - log_min)
+            current_period = math.exp(log_curr)
+
+        return int(current_period)
+
+    # --- 在主循环中调用 ---
+    # swap_threshold = get_trapezoidal_threshold(global_steps, opt.niter * len(dataloader))
+
+    # State tracking
+    k_t = 0.0
+    lambda_k = 0.001
+    gamma = 1.0
+    role_flag = 'A'  # Current Generator (Synthesizer)
+    G_gen, G_critic, opt_G = netA, netB, optimizerA
+    G_name = 'A'
+
+    # switch_threshold_ratio = 1.1  # lambda c
+    # force_switch_steps = 5  # n
+
+    # Logs
+    log_data = []
+    top_model = []
+    top_model_num = 10
+
+    start_time = time.time()
+    global_steps = 0
+    total_steps = int(opt.epoch * len(dataloader))
+    consecutive_steps = 0
+    swap_threshold = 5
+
+    # --- Training Loop ---
+    print("Starting Training...")
+    for epoch in range(opt.niter):
+        for i, (real_imgs, _) in enumerate(dataloader):
+            real_imgs = real_imgs.to(device)
+            batch_size = real_imgs.size(0)
+            z = torch.randn(batch_size, opt.z_dim, 1, 1).to(device)
+
+            G_gen.train()
+            G_critic.eval()
+            netE.train()
+
+            # -------------------------------------------------------------------
+            # Update Discriminator (Encoder E)
+            # -------------------------------------------------------------------
+            set_requires_grad([netA, netB], False)
+            set_requires_grad([netE], True)
+            optimizerE.zero_grad()
+
+            z_real = netE(real_imgs)
+            rec_real_img, rec_real_logits = G_critic(z_real)
+            loss_D_real = F.l1_loss(rec_real_logits, real_imgs)
+
+            fake_imgs, fake_logits = G_gen(z)
+            z_fake = netE(fake_logits.detach())
+            rec_fake_img, rec_fake_logits = G_critic(z_fake)
+            loss_D_fake = F.l1_loss(rec_fake_logits, fake_logits.detach())
+
+            loss_D = loss_D_real - k_t * loss_D_fake
+            loss_D.backward()
+            optimizerE.step()
+
+            # -------------------------------------------------------------------
+            # Update Generator (G_gen)
+            # -------------------------------------------------------------------
+            set_requires_grad([netE, netB, netA], False)
+            set_requires_grad([G_gen], True)
+
+            fake_imgs, fake_logits = G_gen(z)
+            z_gen = netE(fake_logits)
+            rec_gen_img, rec_gen_logits = G_critic(z_gen)
+            # loss_G_fake = F.l1_loss(rec_gen_logits, fake_logits)
+            loss_G = F.l1_loss(rec_gen_logits, fake_logits)
+
+            opt_G.zero_grad()
+            loss_G.backward()
+            opt_G.step()
+
+            # -------------------------------------------------------------------
+            # Update k_t and Measurements
+            # -------------------------------------------------------------------
+            with torch.no_grad():
+                balance = (gamma * loss_D_real.item() - loss_D_fake.item())
+                k_t = k_t + lambda_k * balance
+                k_t = max(min(k_t, 1.0), 0.0)
+
+            # consecutive_steps += 1
+            global_steps += 1
+            swap_threshold -= 1
+
+            if swap_threshold == 0:
+                swap_threshold = get_trapezoidal_threshold(global_steps, total_steps)
+                print(f"Swapping Roles at step {global_steps} (Threshold: {swap_threshold})")
+
+                if role_flag == 'A':
+                    role_flag = 'B'
+                    G_gen, G_critic, opt_G = netB, netA, optimizerB
+                    G_name = 'B'
+                else:
+                    role_flag = 'A'
+                    G_gen, G_critic, opt_G = netA, netB, optimizerA
+                    G_name = 'A'
+
+            if (i+1) % 300 == 0:
+                print(f"[{epoch}/{opt.niter}][{i}/{len(dataloader)}] "
+                      f"Role: G_{G_name} | k_t: {k_t:.4f} | "
+                      f"L_D_real: {loss_D_real.item():.4f} | L_G: {loss_G.item():.4f} | global_step: {global_steps}")
+
+                log_data.append({
+                    'k_t': k_t, 'L_real': loss_D_real.item(), 'L_G': loss_G.item(),
+                    'FID_A': None, 'FID_B': None, 'time': None
+                })
+
+        # --- End of Epoch Actions ---
+        with torch.no_grad():
+            fake_A, _ = netA(fixed_noise)
+            fake_B, _ = netB(fixed_noise)
+
+            save_image(fake_A[0:16], f"{save_img_path}/{epoch}_A.png", nrow=4, normalize=True)
+            save_image(fake_B[0:16], f"{save_img_path}/{epoch}_B.png", nrow=4, normalize=True)
+
+            save_reconstruction_grid(fixed_real, netE, netA, netB, epoch, save_img_path)
+
+        # Calculate FID every N epochs
+        if epoch % opt.fid_interval == 0:
+            print("Calculating FID...")
+            fid_a = calculate_fid(netA, real_ref_path, opt.batchSize, opt.z_dim, device,1000, opt.model)
+            fid_b = calculate_fid(netB, real_ref_path, opt.batchSize, opt.z_dim, device, 1000, opt.model)
+
+            print(f"Epoch {epoch} FID: G_A = {fid_a:.2f}, G_B = {fid_b:.2f}")
+
+            log_data[-1]['FID_A'] = fid_a
+            log_data[-1]['FID_B'] = fid_b
+            log_data[-1]['time'] = (time.time() - start_time)
+
+            fid_avr = (fid_a + fid_b) / 2
+
+            model_A_path = os.path.join(save_model_path, f"gen_A_epoch{epoch}_fid{fid_a:.2f}.pth")
+            model_B_path = os.path.join(save_model_path, f"gen_B_epoch{epoch}_fid{fid_b:.2f}.pth")
+            model_E_path = os.path.join(save_model_path, f"E_epoch{epoch}_fid{fid_avr:.2f}.pth")
+
+            torch.save(netA.state_dict(), model_A_path)
+            torch.save(netB.state_dict(), model_B_path)
+            torch.save(netE.state_dict(), model_E_path)
+
+            top_model.append((fid_avr, model_A_path, model_B_path, model_E_path))
+            top_model.sort(key=lambda x: x[0])
+            if len(top_model) > top_model_num:
+                worst_fid, worst_path_A, worst_path_B, worst_path_E = top_model.pop(-1)  # 弹出最差的
+                if os.path.exists(worst_path_A):
+                    os.remove(worst_path_A)
+                if os.path.exists(worst_path_B):
+                    os.remove(worst_path_B)
+                if os.path.exists(worst_path_E):
+                    os.remove(worst_path_E)  # 删除文件
+
+        pd.DataFrame(log_data).to_csv(f"{opt.outf}/A_training_log.csv", index=False)
+
+
+if __name__ == '__main__':
+    main()
